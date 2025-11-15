@@ -1,3 +1,6 @@
+// Package sysproxy provides macOS-specific implementation for system proxy management.
+// This file contains the Darwin/macOS platform-specific code including the embedded
+// universal binary (amd64/arm64) and privilege elevation logic.
 package sysproxy
 
 import (
@@ -16,6 +19,16 @@ import (
 //go:embed binaries/darwin/sysproxy
 var sysproxy []byte
 
+// ensureElevatedOnDarwin ensures that the helper tool has root:wheel ownership
+// and setuid bit set, which is required for the tool to modify system-wide proxy settings.
+// If the tool is not properly configured, it requests elevation through a system dialog.
+//
+// Parameters:
+//   - be: the byteexec instance containing the helper tool
+//   - prompt: the message to display in the elevation dialog
+//   - iconFullPath: the full path to the icon to display in the elevation dialog
+//
+// Returns an error if elevation fails or if the tool cannot be configured properly.
 func ensureElevatedOnDarwin(be *byteexec.Exec, prompt string, iconFullPath string) (err error) {
 	var s syscall.Stat_t
 	// we just checked its existence, not bother checking specific error again
@@ -30,12 +43,25 @@ func ensureElevatedOnDarwin(be *byteexec.Exec, prompt string, iconFullPath strin
 	return run(cmd)
 }
 
+// detach configures the command to run in a new process group, detached from
+// the parent process. This prevents the child process from being terminated
+// when the parent exits and allows it to continue running independently.
+//
+// On macOS, this is achieved by setting the Setpgid flag in SysProcAttr.
 func detach(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
 }
 
+// SetBypass configures the proxy bypass list for the specified network service.
+// The bypass list contains addresses or domains that should not use the proxy.
+//
+// Parameters:
+//   - service: the network service identifier (e.g., "Wi-Fi", "Ethernet")
+//   - list: comma-separated list of domains or addresses to bypass
+//
+// Returns an error if the operation fails or if EnsureHelperToolPresent has not been called.
 func SetBypass(service, list string) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -52,6 +78,12 @@ func SetBypass(service, list string) error {
 	return nil
 }
 
+// UnSetBypass clears the proxy bypass list for the specified network service.
+//
+// Parameters:
+//   - service: the network service identifier (e.g., "Wi-Fi", "Ethernet")
+//
+// Returns an error if the operation fails or if EnsureHelperToolPresent has not been called.
 func UnSetBypass(service string) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -68,6 +100,13 @@ func UnSetBypass(service string) error {
 	return nil
 }
 
+// GetBypass retrieves the current proxy bypass list for the specified network service.
+//
+// Parameters:
+//   - service: the network service identifier (e.g., "Wi-Fi", "Ethernet")
+//
+// Returns the bypass list as a string (comma-separated), or an error if the operation fails
+// or if EnsureHelperToolPresent has not been called.
 func GetBypass(service string) (string, error) {
 	mu.Lock()
 	defer mu.Unlock()

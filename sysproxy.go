@@ -1,3 +1,9 @@
+// Package sysproxy provides a cross-platform library for managing system proxy settings.
+// It supports Windows, macOS, and Linux platforms by embedding platform-specific
+// helper binaries and executing them to configure system-wide proxy settings.
+//
+// The library ensures thread-safe operations and provides automatic cleanup mechanisms
+// to restore proxy settings when the application terminates.
 package sysproxy
 
 import (
@@ -7,6 +13,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/getlantern/byteexec"
 	"github.com/getlantern/golog"
@@ -62,14 +69,17 @@ func On(addr string) (func() error, error) {
 
 	cmd := be.Command("on", host, port)
 	onErr := run(cmd)
-	off, offErr := waitAndCleanup(host, port)
+
+	// Unlock before calling waitAndCleanup to avoid holding lock during background process setup
+	off, offErr := waitAndCleanup(host, port, &mu, be)
 	if offErr != nil {
 		log.Errorf("Unable to prepare waitAndCleanup job: %v", offErr)
 	}
 	if onErr != nil {
 		return off, onErr
 	}
-	verifyErr := verify(addr)
+
+	verifyErr := verifyUnlocked(addr)
 	return off, verifyErr
 }
 
@@ -90,55 +100,98 @@ func Off(addr string) error {
 	if err := run(cmd); err != nil {
 		return err
 	}
-	return verify("")
+	return verifyUnlocked("")
 }
 
-// Show get the system proxy.
+// Show retrieves the current system proxy configuration.
+// Returns the proxy address as a string, or an error if the operation fails.
 func Show() (string, error) {
-    if be == nil {
-        return "", fmt.Errorf("call EnsureHelperToolPresent() first")
-    }
+	mu.Lock()
+	defer mu.Unlock()
+	if be == nil {
+		return "", fmt.Errorf("call EnsureHelperToolPresent() first")
+	}
 
-    cmd := be.Command("show")
-    out, err := cmd.Output()
-    if err != nil {
-        return "", err
-    }
+	cmd := be.Command("show")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
 
-    return string(out), nil
+	return string(out), nil
 }
 
+// resultType holds the result of an asynchronous command execution.
 type resultType struct {
 	out []byte
 	err error
 }
 
-func waitAndCleanup(host string, port string) (func() error, error) {
-	cmd := be.Command("wait-and-cleanup", host, port)
+// waitAndCleanup starts a detached background process that waits for stdin to be closed,
+// then cleans up the system proxy settings. It returns a cleanup function that, when called,
+// closes the stdin of the detached process to trigger the cleanup operation.
+//
+// The cleanup function waits up to 30 seconds for the process to complete and properly
+// reaps the process to prevent zombie processes. If the timeout is exceeded, the process
+// is killed forcefully.
+//
+// Parameters:
+//   - host: the proxy host to clean up
+//   - port: the proxy port to clean up
+//   - mutex: the mutex to use when verifying the cleanup
+//   - exec: the byteexec instance to use for executing the cleanup command
+//
+// Returns a cleanup function and an error if the process fails to start.
+func waitAndCleanup(host string, port string, mutex *sync.Mutex, exec *byteexec.Exec) (func() error, error) {
+	cmd := exec.Command("wait-and-cleanup", host, port)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
 	}
+
 	// Set up the command to run as a detached process
 	detach(cmd)
 	resultCh := make(chan *resultType)
+
+	// Start the command once
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	// Release process resources to prevent zombie processes
+	// This is safe because we're using Wait() to properly reap the process
 	go func() {
-		out, err := cmd.CombinedOutput()
+		err := cmd.Wait()
+		// After Wait() completes, the process resources are reaped
 		resultCh <- &resultType{
-			out: out,
+			out: nil,
 			err: err,
 		}
 	}()
+
 	return func() error {
 		stdin.Close()
-		result := <-resultCh
-		if result.err != nil {
-			return fmt.Errorf("unable to finish %v: %s\n%s", cmd.Path, result.err, string(result.out))
+
+		// Wait for the cleanup process to complete with a timeout
+		select {
+		case result := <-resultCh:
+			if result.err != nil {
+				return fmt.Errorf("unable to finish %v: %s", cmd.Path, result.err)
+			}
+			return verifyWithLock("", mutex, exec)
+		case <-time.After(30 * time.Second):
+			// Kill the process if it's still running
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+				// Wait for the goroutine to finish and reap the process
+				<-resultCh
+			}
+			return fmt.Errorf("timeout waiting for cleanup process to finish")
 		}
-		return verify("")
 	}, nil
 }
 
+// run executes the given command and captures its output for logging and error reporting.
 func run(cmd *exec.Cmd) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -148,7 +201,16 @@ func run(cmd *exec.Cmd) error {
 	return nil
 }
 
-func verify(expected string) error {
+// verifyUnlocked verifies the system proxy configuration matches the expected value.
+// This function assumes the caller already holds the necessary locks and does not
+// acquire any locks itself. It queries the system proxy settings and compares them
+// to the expected value.
+//
+// Parameters:
+//   - expected: the expected proxy address (empty string for no proxy)
+//
+// Returns an error if verification fails or if the actual value doesn't match expected.
+func verifyUnlocked(expected string) error {
 	cmd := be.Command("show")
 	out, err := cmd.Output()
 	if err != nil {
@@ -162,6 +224,41 @@ func verify(expected string) error {
 	return nil
 }
 
+// verifyWithLock verifies the system proxy configuration while safely acquiring
+// the provided mutex. This is used by asynchronous operations that need to verify
+// the proxy state from goroutines or callbacks.
+//
+// Parameters:
+//   - expected: the expected proxy address (empty string for no proxy)
+//   - mutex: the mutex to acquire before accessing shared resources
+//   - exec: the byteexec instance to use for executing the verification command
+//
+// Returns an error if verification fails or if the actual value doesn't match expected.
+func verifyWithLock(expected string, mutex *sync.Mutex, exec *byteexec.Exec) error {
+	mutex.Lock()
+	defer mutex.Unlock()
+	cmd := exec.Command("show")
+	out, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+	actual := string(out)
+	log.Debugf("Command %v output %v", cmd.Path, actual)
+	if !allEquals(expected, actual) {
+		return fmt.Errorf("unexpected output: expect '%s', got '%s'", expected, actual)
+	}
+	return nil
+}
+
+// allEquals checks if all non-empty lines in the actual output equal the expected value.
+// It handles cases where the output contains multiple lines with the same value or
+// empty/whitespace-only lines. Uses XOR logic to ensure both are either empty or non-empty.
+//
+// Parameters:
+//   - expected: the expected proxy address
+//   - actual: the actual output from the system proxy query (may contain multiple lines)
+//
+// Returns true if all non-empty lines match the expected value, false otherwise.
 func allEquals(expected string, actual string) bool {
 	if (expected == "") != (strings.TrimSpace(actual) == "") { // XOR
 		return false
